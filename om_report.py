@@ -50,14 +50,29 @@ def learn(report_bytes):
     agents = [sst[int(v)] for _, v in re.findall(r'<c r="([B-Z]+2)"[^>]*t="s"[^>]*><v>(\d+)</v>', r2)]
     tail = _tail(z, paths[DATA]).decode("utf-8", "ignore")
     rows = list(re.finditer(r'<row r="(\d+)"[^>]*>(.*?)</row>', tail, flags=re.S))[1:]
-    done, last = set(), rows[-1].group(2)
+    done, last, tc = set(), rows[-1].group(2), {}
     for m in rows:
+        e = re.search(r'<c r="E\d+"([^>]*)>(.*?)</c>', m.group(2), flags=re.S)
+        if e:
+            t = sst[int(re.search(r"<v>(\d+)</v>", e.group(2)).group(1))] if 't="s"' in e.group(1) else re.sub(r"<[^>]+>", "", e.group(2))
+            tc[t] = tc.get(t, 0) + 1
         d = re.search(r'<c r="B\d+"[^>]*><v>(\d+)</v>', m.group(2)); n = re.search(r'<c r="D\d+"([^>]*)>(.*?)</c>', m.group(2), flags=re.S)
         if d and n:
             nm = sst[int(re.search(r"<v>(\d+)</v>", n.group(2)).group(1))] if 't="s"' in n.group(1) else re.sub(r"<[^>]+>", "", n.group(2))
             done.add((int(d.group(1)), nm))
     styles = dict(re.findall(r'<c r="([A-Z]+)\d+" s="(\d+)"', last))
-    return {"agents": agents, "done": done, "styles": styles, "sheets": set(paths)}
+    tasks = {"freight correction": "Freight Correction", "raytheon": "Raytheon"}   # known task types, then the report's own spellings
+    for t, n in sorted(tc.items(), key=lambda kv: kv[1]): tasks[re.sub(r"[^a-z]", "", t.lower())] = t      # most frequent spelling wins
+    tasks["pastdue"] = "Past Due"
+    return {"agents": agents, "done": done, "styles": styles, "sheets": set(paths), "tasks": tasks}
+
+def norm_task(v, tasks):
+    """Keep the report's own task names (Past Due, Chamber Orders, Jensen Tool Kits, Raytheon...). Returns (task, warning|None)."""
+    k = re.sub(r"[^a-z]", "", str(v).lower())
+    if k in tasks: return tasks[k], None
+    if k.startswith("chamber") and "chamberorders" in tasks: return tasks["chamberorders"], None
+    if (k.startswith("jensen") or k.startswith("jtk")) and "jensentoolkits" in tasks: return tasks["jensentoolkits"], None
+    return str(v).strip(), f"New TASK '{str(v).strip()}' (not used in the report before) - kept as typed"
 
 def guess_agent(filename, agents):
     f = re.sub(r"[^a-z]", "", filename.lower())
@@ -66,7 +81,7 @@ def guess_agent(filename, agents):
         if k and (k in f or a.split()[0].lower() in f): return a
     return None
 
-def clean(eod_path_or_file, agent, date, mapping=None):
+def clean(eod_path_or_file, agent, date, tasks, mapping=None):
     """One agent's EOD (first sheet) -> rows in Data-sheet column order, plus warnings."""
     xl = pd.ExcelFile(eod_path_or_file); df = xl.parse(0); w = []
     if mapping is None:   # buyer code -> full name, from the helper sheet found in the EOD itself (A1 = B1 = 'Buyer Name')
@@ -87,8 +102,8 @@ def clean(eod_path_or_file, agent, date, mapping=None):
     for c in ("order", "suffix", "line"): df[c] = df[c].map(ints)
     df["disp"] = df.disp.astype(str).str.strip(); df["vendor"] = df.vendor.astype(str).str.strip()
     df["comm"] = df.comm.map(lambda v: None if pd.isna(v) else (v if isinstance(v, (pd.Timestamp, dt.datetime)) else str(v).strip()))
-    bad = df[df.task.astype(str).str.strip().str.lower() != "past due"]
-    for v in sorted(set(bad.task.astype(str))): w.append(f"TASK '{v}' is not 'Past Due' - changed to 'Past Due'")
+    res = df.task.map(lambda v: norm_task("Past Due" if pd.isna(v) else v, tasks)); df["task"] = res.map(lambda t: t[0])
+    w += [x for x in sorted({t[1] for t in res} - {None})]
     d = pd.Timestamp(date).normalize()
     return d, df, w
 
@@ -104,7 +119,7 @@ def update_report(report_bytes, jobs):
     ctx = learn(report_bytes); log = []; frames = []
     for f, agent, date in jobs:
         if agent not in ctx["agents"]: log.append(f"WARNING agent '{agent}' is not a column in the report's Daily sheet")
-        d, df, w = clean(f, agent, date); log += [f"WARNING {agent}: {x}" for x in sorted(set(w))]
+        d, df, w = clean(f, agent, date, ctx["tasks"]); log += [f"WARNING {agent}: {x}" for x in sorted(set(w))]
         if (int((d.to_pydatetime() - EPOCH).days), agent) in ctx["done"]: raise ValueError(f"Already loaded: {agent} for {d:%d-%b-%Y}. Nothing was added.")
         frames.append((d, agent, df))
     if len({(d, a) for d, a, _ in frames}) < len(frames): raise ValueError("The same agent and date was selected twice.")
@@ -132,7 +147,7 @@ def update_report(report_bytes, jobs):
             xr = []; r = last_row
             for d, agent, df in sorted(frames, key=lambda t: (t[0], t[1])):
                 for x in df.itertuples(index=False):
-                    r += 1; vals = [month_label(d, ctx["sheets"]), d, week_of(d), agent, TASK, x.order, x.suffix, x.line, x.vendor, x.buyer, x.disp, x.comm, None, None]
+                    r += 1; vals = [month_label(d, ctx["sheets"]), d, week_of(d), agent, x.task, x.order, x.suffix, x.line, x.vendor, x.buyer, x.disp, x.comm, None, None]
                     xr.append(f'<row r="{r}">' + "".join(_cell(f"{LET[j]}{r}", v, st.get(LET[j])) for j, v in enumerate(vals)) + "</row>")
             rows_xml = "".join(xr).encode(); carry = b""; data = first
             while True:
